@@ -134,7 +134,7 @@ int main(void)
 
 		// send a string as fast as possible, for 10 seconds
 		while (1) {
-			usb_serial_write(test_string, (uint16_t)(sizeof(test_string)-1));
+			usb_serial_write((uint8_t*)test_string, (uint16_t)(sizeof(test_string)-1));
 			if (IS_TIMER0_OVERFLOW()) {
 				CLEAR_TIMER0_OVERFLOW();
 				count++;

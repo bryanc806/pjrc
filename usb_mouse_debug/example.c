@@ -32,11 +32,12 @@
 #define LED_OFF		(PORTD |= (1<<6))
 #define CPU_PRESCALE(n)	(CLKPR = 0x80, CLKPR = (n))
 
-int8_t circle[];
+const int8_t circle[];
 
 int main(void)
 {
-	int8_t x, y, *p;
+	int8_t x, y;
+	const int8_t *p;
 	uint8_t i;
 
 	// set for 16 MHz clock
@@ -77,7 +78,7 @@ int main(void)
 }
 
 
-int8_t PROGMEM circle[] = {
+const int8_t PROGMEM circle[] = {
 16, -1,
 15, -4,
 14, -7,
