@@ -26,3 +26,13 @@ This git repo contains a collection of the teensy bare metal "Code Library"
 snippets that can be downloaded one by one from their page. The purpose is easy
 integration into other projects e.g. as git submodule, while keeping the
 original code in one place.
+
+Updates in the bryanc806 repo:
+
+hid_WINDOWS.c has been updated (rather hackishly I should add) to
+support multiple RawHID devices with different VID/PIDs and accessed
+from different threads of the same program.
+
+The API has changed a bit in that you provide the VID/PID on all
+rawhid_recv() and rawhid_send() calls.
+

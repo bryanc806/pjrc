@@ -33,7 +33,9 @@
 #include <stdint.h>
 #include <windows.h>
 #include <setupapi.h>
-#include <ddk/hidsdi.h>
+//#include <shared/hidsdi.h>
+//#include <shared/hidclass.h>
+#include <api/hidsdi.h>
 #include <ddk/hidclass.h>
 
 #include "hid.h"
@@ -42,29 +44,58 @@
 // a list of all opened HID devices, so the caller can
 // simply refer to them by number
 typedef struct hid_struct hid_t;
-static hid_t *first_hid = NULL;
-static hid_t *last_hid = NULL;
 struct hid_struct {
 	HANDLE handle;
 	int open;
 	struct hid_struct *prev;
 	struct hid_struct *next;
 };
-static HANDLE rx_event=NULL;
-static HANDLE tx_event=NULL;
-static CRITICAL_SECTION rx_mutex;
-static CRITICAL_SECTION tx_mutex;
 
+struct	instance_info
+{
+	int vid, pid;
+	hid_t *first_hid;
+	hid_t *last_hid;
+	HANDLE rx_event;
+	HANDLE tx_event;
+	CRITICAL_SECTION rx_mutex;
+	CRITICAL_SECTION tx_mutex;
+} instances[10] = {0};
 
 // private functions, not intended to be used from outside this file
-static void add_hid(hid_t *h);
-static hid_t * get_hid(int num);
-static void free_all_hid(void);
+struct instance_info	*get_instance(int vid, int pid);
+static void add_hid(struct instance_info	*, hid_t *h);
+static hid_t * get_hid(struct instance_info	*, int num);
+static void free_all_hid(struct instance_info	*);
 static void hid_close(hid_t *hid);
 void print_win32_err(void);
 
+struct	instance_info	*get_instance(int vid, int pid)
+{
+	int i;
+	for (i = 0; i < _countof(instances); i++)
+	{
+		if (vid == instances[i].vid && pid == instances[i].pid)
+			return &instances[i];
+	}
+	return 0;
+}
 
-
+struct	instance_info	*add_instance(int vid, int pid)
+{
+	int i;
+	for (i = 0; i < _countof(instances); i++)
+	{
+		if (instances[i].vid == 0 && instances[i].pid == 0)
+		{
+			memset(&instances[i], 0, sizeof(struct instance_info));
+			instances[i].vid = vid;
+			instances[i].pid = pid;
+			return &instances[i];
+		}
+	}
+	return 0;
+}
 
 //  rawhid_recv - receive a packet
 //    Inputs:
@@ -75,40 +106,45 @@ void print_win32_err(void);
 //    Output:
 //	number of bytes received, or -1 on error
 //
-int rawhid_recv(int num, void *buf, int len, int timeout)
+int rawhid_recv(int vid, int pid, int num, void *buf, int len, int timeout)
 {
 	hid_t *hid;
 	unsigned char tmpbuf[516];
 	OVERLAPPED ov;
 	DWORD n, r;
+	struct	instance_info	*instance;
 
 	if (sizeof(tmpbuf) < len + 1) return -1;
-	hid = get_hid(num);
+
+	instance = get_instance(vid, pid);
+	if (!instance)
+		return -1;
+	hid = get_hid(instance, num);
 	if (!hid || !hid->open) return -1;
-	EnterCriticalSection(&rx_mutex);
-	ResetEvent(&rx_event);
+	EnterCriticalSection(&instance->rx_mutex);
+	ResetEvent(&instance->rx_event);
 	memset(&ov, 0, sizeof(ov));
-	ov.hEvent = rx_event;
+	ov.hEvent = instance->rx_event;
 	if (!ReadFile(hid->handle, tmpbuf, len + 1, NULL, &ov)) {
 		if (GetLastError() != ERROR_IO_PENDING) goto return_error;
-		r = WaitForSingleObject(rx_event, timeout);
+		r = WaitForSingleObject(instance->rx_event, timeout);
 		if (r == WAIT_TIMEOUT) goto return_timeout;
 		if (r != WAIT_OBJECT_0) goto return_error;
 	}
 	if (!GetOverlappedResult(hid->handle, &ov, &n, FALSE)) goto return_error;
-	LeaveCriticalSection(&rx_mutex);
+	LeaveCriticalSection(&instance->rx_mutex);
 	if (n <= 0) return -1;
 	n--;
-	if (n > len) n = len;
+	if ((int)n > len) n = len;
 	memcpy(buf, tmpbuf + 1, n);
 	return n;
 return_timeout:
 	CancelIo(hid->handle);
-	LeaveCriticalSection(&rx_mutex);
+	LeaveCriticalSection(&instance->rx_mutex);
 	return 0;
 return_error:
 	print_win32_err();
-	LeaveCriticalSection(&rx_mutex);
+	LeaveCriticalSection(&instance->rx_mutex);
 	return -1;
 }
 
@@ -121,39 +157,43 @@ return_error:
 //    Output:
 //	number of bytes sent, or -1 on error
 //
-int rawhid_send(int num, void *buf, int len, int timeout)
+int rawhid_send(int vid, int pid, int num, void *buf, int len, int timeout)
 {
 	hid_t *hid;
 	unsigned char tmpbuf[516];
 	OVERLAPPED ov;
 	DWORD n, r;
-
+	struct	instance_info	*instance;
 	if (sizeof(tmpbuf) < len + 1) return -1;
-	hid = get_hid(num);
+
+	instance = get_instance(vid, pid);
+	if (!instance)
+		return -1;
+	hid = get_hid(instance, num);
 	if (!hid || !hid->open) return -1;
-	EnterCriticalSection(&tx_mutex);
-	ResetEvent(&tx_event);
+	EnterCriticalSection(&instance->tx_mutex);
+	ResetEvent(&instance->tx_event);
 	memset(&ov, 0, sizeof(ov));
-	ov.hEvent = tx_event;
+	ov.hEvent = instance->tx_event;
 	tmpbuf[0] = 0;
 	memcpy(tmpbuf + 1, buf, len);
 	if (!WriteFile(hid->handle, tmpbuf, len + 1, NULL, &ov)) {
 		if (GetLastError() != ERROR_IO_PENDING) goto return_error;
-		r = WaitForSingleObject(tx_event, timeout);
+		r = WaitForSingleObject(instance->tx_event, timeout);
 		if (r == WAIT_TIMEOUT) goto return_timeout;
 		if (r != WAIT_OBJECT_0) goto return_error;
 	}
 	if (!GetOverlappedResult(hid->handle, &ov, &n, FALSE)) goto return_error;
-	LeaveCriticalSection(&tx_mutex);
+	LeaveCriticalSection(&instance->tx_mutex);
 	if (n <= 0) return -1;
 	return n - 1;
 return_timeout:
 	CancelIo(hid->handle);
-	LeaveCriticalSection(&tx_mutex);
+	LeaveCriticalSection(&instance->tx_mutex);
 	return 0;
 return_error:
 	print_win32_err();
-	LeaveCriticalSection(&tx_mutex);
+	LeaveCriticalSection(&instance->tx_mutex);
 	return -1;
 }
 
@@ -180,16 +220,23 @@ int rawhid_open(int max, int vid, int pid, int usage_page, int usage)
         HIDP_CAPS capabilities;
         HANDLE h;
         BOOL ret;
+	struct	instance_info	*instance;
 	hid_t *hid;
 	int count=0;
 
-	if (first_hid) free_all_hid();
+	instance = get_instance(vid, pid);
+	if (!instance)
+	{
+		instance = add_instance(vid, pid);
+	}
+
+	if (instance->first_hid) free_all_hid(instance);
 	if (max < 1) return 0;
-	if (!rx_event) {
-		rx_event = CreateEvent(NULL, TRUE, TRUE, NULL);
-		tx_event = CreateEvent(NULL, TRUE, TRUE, NULL);
-		InitializeCriticalSection(&rx_mutex);
-		InitializeCriticalSection(&tx_mutex);
+	if (!instance->rx_event) {
+		instance->rx_event = CreateEvent(NULL, TRUE, TRUE, NULL);
+		instance->tx_event = CreateEvent(NULL, TRUE, TRUE, NULL);
+		InitializeCriticalSection(&instance->rx_mutex);
+		InitializeCriticalSection(&instance->tx_mutex);
 	}
 	HidD_GetHidGuid(&guid);
 	info = SetupDiGetClassDevs(&guid, NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
@@ -239,7 +286,7 @@ int rawhid_open(int max, int vid, int pid, int usage_page, int usage)
 		}
 		hid->handle = h;
 		hid->open = 1;
-		add_hid(hid);
+		add_hid(instance, hid);
 		count++;
 		if (count >= max) return count;
 	}
@@ -254,53 +301,55 @@ int rawhid_open(int max, int vid, int pid, int usage_page, int usage)
 //    Output
 //	(nothing)
 //
-void rawhid_close(int num)
+void rawhid_close(int vid, int pid, int num)
 {
 	hid_t *hid;
-
-	hid = get_hid(num);
+	struct	instance_info	*instance = get_instance(vid, pid);
+	if (!instance)
+		return;
+	hid = get_hid(instance, num);
 	if (!hid || !hid->open) return;
 	hid_close(hid);
 }
 
 
 
-static void add_hid(hid_t *h)
+static void add_hid(struct instance_info *instance, hid_t *h)
 {
-	if (!first_hid || !last_hid) {
-		first_hid = last_hid = h;
+	if (!instance->first_hid || !instance->last_hid) {
+		instance->first_hid = instance->last_hid = h;
 		h->next = h->prev = NULL;
 		return;
 	}
-	last_hid->next = h;
-	h->prev = last_hid;
+	instance->last_hid->next = h;
+	h->prev = instance->last_hid;
 	h->next = NULL;
-	last_hid = h;
+	instance->last_hid = h;
 }
 
 
-static hid_t * get_hid(int num)
+static hid_t * get_hid(struct instance_info *instance, int num)
 {
 	hid_t *p;
-	for (p = first_hid; p && num > 0; p = p->next, num--) ;
+	for (p = instance->first_hid; p && num > 0; p = p->next, num--) ;
 	return p;
 }
 
 
-static void free_all_hid(void)
+static void free_all_hid(struct instance_info	*instance)
 {
 	hid_t *p, *q;
 
-	for (p = first_hid; p; p = p->next) {
+	for (p = instance->first_hid; p; p = p->next) {
 		hid_close(p);
 	}
-	p = first_hid;
+	p = instance->first_hid;
 	while (p) {
 		q = p;
 		p = p->next;
 		free(q);
 	}
-	first_hid = last_hid = NULL;
+	instance->first_hid = instance->last_hid = NULL;
 }
 
 
@@ -317,7 +366,7 @@ void print_win32_err(void)
 	DWORD err;
 
 	err = GetLastError();
-	FormatMessage(FORMAT_MESSAGE_FROM_SYSTEM, NULL, err,
+	FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM, NULL, err,
 		0, buf, sizeof(buf), NULL);
 	printf("err %ld: %s\n", err, buf);
 }
